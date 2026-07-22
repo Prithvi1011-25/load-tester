@@ -883,10 +883,11 @@ function fmtMs(ms) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 class TokenBucket {
-  constructor(rpm) {
+  constructor(rpm, burst = 5) {
     this.intervalMs = 60000 / rpm;
-    this.tokens = Math.min(rpm, 5);
-    this.max = Math.min(rpm, 5);
+    // Allow a larger initial burst so high-concurrency probes can fill the pipeline
+    this.max = Math.max(1, Math.min(rpm, burst));
+    this.tokens = this.max;
     this.lastRefill = performance.now();
   }
   async acquire() {
@@ -982,7 +983,7 @@ async function startTest() {
 
   setUIState('running');
 
-  const limiter = new TokenBucket(rpm);
+  const limiter = new TokenBucket(rpm, Math.min(concurrency, rpm, 35));
   const sem = new Semaphore(concurrency);
   const endTime = testStartTime + duration * 1000;
   const inflight = [];
