@@ -343,8 +343,13 @@
         <textarea id="cfgPrompt" rows="3" placeholder="Enter your test prompt...">Describe this image in detail. Focus on objects, colors, materials, and spatial layout.</textarea>
       </div>
 
+      <div class="config-group wide" id="bflImageUrlGroup">
+        <label>Input Image URL (BFL preferred)</label>
+        <input type="text" id="cfgImageUrl" placeholder="https://example.com/room.jpg" />
+      </div>
+
       <div class="config-group wide">
-        <label>Test Images (up to 3)</label>
+        <label>Test Images (up to 3) — used if no URL; BFL uses base64 fallback</label>
         <div class="image-upload-zone" id="uploadZone">
           <p>Click or drag & drop images here (JPEG, PNG, WebP — max 4MB each)</p>
           <input type="file" id="fileInput" accept="image/jpeg,image/png,image/webp" multiple class="hidden" />
@@ -457,12 +462,12 @@ const MODEL_PRESETS = {
     'black-forest-labs/flux-kontext-pro',
   ],
   bfl: [
+    'flux-2-klein-9b',
+    'flux-2-klein-4b',
     'flux-2-pro',
     'flux-2-pro-preview',
     'flux-2-max',
     'flux-2-flex',
-    'flux-2-klein-4b',
-    'flux-2-klein-9b',
     'flux-kontext-pro',
     'flux-kontext-max',
     'flux-pro-1.1',
@@ -517,8 +522,28 @@ async function init() {
   initCharts();
 
   document.getElementById('cfgProvider').addEventListener('change', () => {
-    renderModelPresets();
+    onProviderChange();
   });
+}
+
+function onProviderChange() {
+  const provider = document.getElementById('cfgProvider').value;
+  const presets = MODEL_PRESETS[provider] || [];
+  if (presets.length > 0) {
+    document.getElementById('cfgModel').value = presets[0];
+  }
+
+  if (provider === 'bfl') {
+    document.getElementById('cfgPrompt').value = 'Make the room brighter';
+    document.getElementById('cfgRpm').value = '12';
+    document.getElementById('cfgConcurrency').value = '6';
+    document.getElementById('cfgDuration').value = '300';
+    document.getElementById('cfgConcurrency').max = 20;
+  } else {
+    document.getElementById('cfgConcurrency').max = 100;
+  }
+
+  renderModelPresets();
 }
 
 function updateProviderOptions() {
@@ -533,7 +558,7 @@ function updateProviderOptions() {
   for (const opt of select.options) {
     if (!opt.disabled) { select.value = opt.value; break; }
   }
-  renderModelPresets();
+  onProviderChange();
 }
 
 function renderModelPresets() {
@@ -897,11 +922,20 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 // Test Engine
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async function fireOneRequest(provider, model, prompt, images, maxTokens, temperature) {
+async function fireOneRequest(provider, model, prompt, images, maxTokens, temperature, extras = {}) {
   const body = { provider, model, prompt, maxTokens, temperature };
+
+  if (extras.imageUrl) {
+    body.imageUrl = extras.imageUrl;
+  }
 
   if (images.length > 0) {
     body.images = images.map(img => ({ base64: img.base64, mimeType: img.mimeType }));
+  }
+
+  if (provider === 'bfl') {
+    body.outputFormat = extras.outputFormat || 'jpeg';
+    body.safetyTolerance = extras.safetyTolerance ?? 2;
   }
 
   const resp = await fetch(`${API_BASE}/api/test-request`, {
@@ -925,9 +959,21 @@ async function startTest() {
   const maxTokens = maxTokensRaw ? parseInt(maxTokensRaw, 10) : null;
   const temperature = parseFloat(document.getElementById('cfgTemp').value);
   const prompt = document.getElementById('cfgPrompt').value.trim();
+  const imageUrl = document.getElementById('cfgImageUrl').value.trim();
 
   if (!model) { alert('Please enter a model name'); return; }
   if (!prompt) { alert('Please enter a test prompt'); return; }
+
+  if (provider === 'bfl') {
+    if (!imageUrl && uploadedImages.length === 0) {
+      alert('BFL requires an input image URL (preferred) or an uploaded image');
+      return;
+    }
+    if (concurrency > 20) {
+      alert('BFL concurrency should be ≤ 20 (active task limit). Lower concurrency and try again.');
+      return;
+    }
+  }
 
   testRunning = true;
   testAborted = false;
@@ -956,6 +1002,8 @@ async function startTest() {
     });
   };
 
+  const requestExtras = { imageUrl, outputFormat: 'jpeg', safetyTolerance: 2 };
+
   while (testRunning && !testAborted && Date.now() < endTime) {
     await limiter.acquire();
     if (!testRunning || testAborted || Date.now() >= endTime) break;
@@ -963,7 +1011,7 @@ async function startTest() {
     await sem.acquire();
     if (!testRunning || testAborted) { sem.release(); break; }
 
-    const p = fireOneRequest(provider, model, prompt, uploadedImages, maxTokens, temperature)
+    const p = fireOneRequest(provider, model, prompt, uploadedImages, maxTokens, temperature, requestExtras)
       .then((res) => {
         results.push({
           ...res, prompt, model, provider,
@@ -1049,7 +1097,7 @@ function setUIState(state) {
 }
 
 function setConfigDisabled(disabled) {
-  const ids = ['cfgProvider','cfgModel','cfgRpm','cfgConcurrency','cfgDuration','cfgMaxTokens','cfgTemp','cfgPrompt'];
+  const ids = ['cfgProvider','cfgModel','cfgRpm','cfgConcurrency','cfgDuration','cfgMaxTokens','cfgTemp','cfgPrompt','cfgImageUrl'];
   ids.forEach(id => { document.getElementById(id).disabled = disabled; });
 }
 

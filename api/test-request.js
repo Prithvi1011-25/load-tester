@@ -38,16 +38,16 @@ function classifyError(error) {
     return 'rate_limit';
   if (status === 402 || msg.includes('credit'))
     return 'rate_limit';
+  if (status === 408 || msg.includes('timeout') || msg.includes('etimedout') || msg.includes('deadline') || msg.includes('aborted'))
+    return 'timeout';
   if (status === 401 || status === 403 || msg.includes('api key') || msg.includes('unauthorized'))
     return 'auth_error';
   if (msg.includes('safety') || msg.includes('blocked') || msg.includes('moderated'))
     return 'safety_block';
-  if (status === 400 || msg.includes('invalid'))
+  if (status === 400 || msg.includes('invalid') || msg.includes('requires input_image'))
     return 'invalid_request';
   if (status >= 500 || msg.includes('internal') || msg.includes('unavailable'))
     return 'server_error';
-  if (msg.includes('timeout') || msg.includes('etimedout') || msg.includes('deadline'))
-    return 'timeout';
   if (msg.includes('econnrefused') || msg.includes('enotfound') || msg.includes('network'))
     return 'network';
   return 'unknown';
@@ -197,38 +197,77 @@ async function runOpenRouterRequest({ model, prompt, images, maxTokens, temperat
 }
 
 // ─── Black Forest Labs (BFL) ────────────────────────────────────────────────────
+// Aligned with prod: POST /v1/{model} → poll polling_url or GET /v1/get_result?id=
+
+const BFL_BASE_URL = 'https://api.bfl.ai/v1';
+const BFL_POLL_INTERVAL_MS = 2000;
+const BFL_MAX_POLL_ATTEMPTS = 60; // ~120s
+const BFL_READY_STATUSES = new Set(['ready', 'completed']);
+const BFL_TERMINAL_FAIL = new Set([
+  'failed',
+  'error',
+  'request moderated',
+  'content moderated',
+  'moderated',
+]);
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function runBFLRequest({ model, prompt, images }) {
+function extractBFLOutput(result) {
+  const r = result?.result || result || {};
+  return r.sample || r.image_url || r.output || '';
+}
+
+async function runBFLRequest({ model, prompt, images, imageUrl, outputFormat, safetyTolerance }) {
   const apiKey = process.env.BFL_API_KEY;
-  const endpoint = String(model || '').replace(/^\//, '');
-  if (!endpoint) {
-    throw new Error('BFL model/endpoint is required (e.g. flux-2-pro)');
-  }
+  const endpoint = String(model || '').replace(/^\//, '') || 'flux-2-klein-9b';
 
-  const body = { prompt };
+  const body = {
+    prompt,
+    output_format: outputFormat || 'jpeg',
+    safety_tolerance: safetyTolerance ?? 2,
+  };
 
-  if (images && images.length > 0) {
+  const publicUrl = typeof imageUrl === 'string' ? imageUrl.trim() : '';
+  if (publicUrl) {
+    body.input_image = publicUrl;
+  } else if (images && images.length > 0) {
     body.input_image = images[0].base64;
     if (images[1]) body.input_image_2 = images[1].base64;
     if (images[2]) body.input_image_3 = images[2].base64;
   } else {
-    body.width = 1024;
-    body.height = 1024;
+    const err = new Error('BFL requires input_image (public URL preferred, or uploaded base64)');
+    err.status = 400;
+    throw err;
   }
 
-  const submitResp = await fetch(`https://api.bfl.ai/v1/${endpoint}`, {
-    method: 'POST',
-    headers: {
-      accept: 'application/json',
-      'Content-Type': 'application/json',
-      'x-key': apiKey,
-    },
-    body: JSON.stringify(body),
-  });
+  const controller = new AbortController();
+  const createTimeout = setTimeout(() => controller.abort(), 120000);
+
+  let submitResp;
+  try {
+    submitResp = await fetch(`${BFL_BASE_URL}/${endpoint}`, {
+      method: 'POST',
+      headers: {
+        accept: 'application/json',
+        'Content-Type': 'application/json',
+        'x-key': apiKey,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      const err = new Error('BFL create timeout (120s)');
+      err.status = 408;
+      throw err;
+    }
+    throw e;
+  } finally {
+    clearTimeout(createTimeout);
+  }
 
   if (!submitResp.ok) {
     const errBody = await submitResp.text();
@@ -238,16 +277,16 @@ async function runBFLRequest({ model, prompt, images }) {
   }
 
   const submitData = await submitResp.json();
-  const pollingUrl = submitData.polling_url;
+  const jobId = submitData.id;
+  const pollingUrl = submitData.polling_url
+    || (jobId ? `${BFL_BASE_URL}/get_result?id=${encodeURIComponent(jobId)}` : null);
+
   if (!pollingUrl) {
-    throw new Error(`BFL response missing polling_url: ${JSON.stringify(submitData)}`);
+    throw new Error(`BFL response missing id/polling_url: ${JSON.stringify(submitData)}`);
   }
 
-  // Stay under Vercel function maxDuration (60s)
-  const deadline = Date.now() + 50000;
-
-  while (Date.now() < deadline) {
-    await sleep(500);
+  for (let attempt = 0; attempt < BFL_MAX_POLL_ATTEMPTS; attempt++) {
+    await sleep(BFL_POLL_INTERVAL_MS);
 
     const pollResp = await fetch(pollingUrl, {
       headers: {
@@ -264,23 +303,24 @@ async function runBFLRequest({ model, prompt, images }) {
     }
 
     const result = await pollResp.json();
-    const status = result.status;
+    const status = String(result.status || '').toLowerCase();
 
-    if (status === 'Ready') {
-      const sample = result.result?.sample || '';
+    if (BFL_READY_STATUSES.has(status)) {
+      const output = extractBFLOutput(result);
+      const outputStr = typeof output === 'string' ? output : JSON.stringify(output);
       return {
-        responseChars: sample.length,
-        hasImage: !!sample,
-        responseText: sample.slice(0, 500),
+        responseChars: outputStr.length,
+        hasImage: !!outputStr,
+        responseText: outputStr.slice(0, 500),
       };
     }
 
-    if (['Error', 'Failed', 'Request Moderated', 'Content Moderated'].includes(status)) {
-      throw new Error(`BFL generation ${status}: ${JSON.stringify(result)}`);
+    if (BFL_TERMINAL_FAIL.has(status)) {
+      throw new Error(`BFL generation ${result.status}: ${JSON.stringify(result)}`);
     }
   }
 
-  const timeoutErr = new Error('BFL timeout: result not ready within deadline');
+  const timeoutErr = new Error('BFL timeout: result not ready within ~120s (60 poll attempts)');
   throw timeoutErr;
 }
 
@@ -333,7 +373,17 @@ module.exports = async (req, res) => {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  const { provider, model, prompt, images, maxTokens, temperature } = req.body;
+  const {
+    provider,
+    model,
+    prompt,
+    images,
+    imageUrl,
+    maxTokens,
+    temperature,
+    outputFormat,
+    safetyTolerance,
+  } = req.body;
 
   if (!provider || !model || !prompt) {
     return res.status(400).json({ error: 'Missing required fields: provider, model, prompt' });
@@ -368,7 +418,14 @@ module.exports = async (req, res) => {
         break;
       }
       case 'bfl': {
-        result = await runBFLRequest({ model, prompt, images });
+        result = await runBFLRequest({
+          model,
+          prompt,
+          images,
+          imageUrl,
+          outputFormat,
+          safetyTolerance,
+        });
         break;
       }
       default:
