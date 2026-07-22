@@ -538,7 +538,7 @@ function onProviderChange() {
     document.getElementById('cfgRpm').value = '12';
     document.getElementById('cfgConcurrency').value = '6';
     document.getElementById('cfgDuration').value = '300';
-    document.getElementById('cfgConcurrency').max = 20;
+    document.getElementById('cfgConcurrency').max = 35;
   } else {
     document.getElementById('cfgConcurrency').max = 100;
   }
@@ -969,8 +969,8 @@ async function startTest() {
       alert('BFL requires an input image URL (preferred) or an uploaded image');
       return;
     }
-    if (concurrency > 20) {
-      alert('BFL concurrency should be ≤ 20 (active task limit). Lower concurrency and try again.');
+    if (concurrency > 35) {
+      alert('BFL concurrency should be ≤ 35. Lower concurrency and try again.');
       return;
     }
   }
